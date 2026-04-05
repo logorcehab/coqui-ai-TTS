@@ -1,4 +1,4 @@
-import logging
+import os
 import random
 import sys
 
@@ -7,8 +7,6 @@ import torch.nn.functional as F
 import torch.utils.data
 
 from TTS.tts.models.xtts import load_audio
-
-logger = logging.getLogger(__name__)
 
 torch.set_num_threads(1)
 
@@ -25,29 +23,41 @@ def key_samples_by_col(samples, col):
     return samples_by_col
 
 
-def get_prompt_slice(gt_path, max_sample_length, min_sample_length, sample_rate, is_eval=False):
-    rel_clip = load_audio(gt_path, sample_rate)
-    # if eval uses a middle size sample when it is possible to be more reproducible
-    if is_eval:
-        sample_length = int((min_sample_length + max_sample_length) / 2)
-    else:
-        sample_length = random.randint(min_sample_length, max_sample_length)
-    gap = rel_clip.shape[-1] - sample_length
-    if gap < 0:
-        sample_length = rel_clip.shape[-1] // 2
-    gap = rel_clip.shape[-1] - sample_length
+def get_prompt_slice(gt_path, max_sample_length, min_sample_length, sample_rate, is_eval=False, ref_path="null"):
+    if ref_path == "null":
+        rel_clip = load_audio(gt_path, sample_rate)
+        # if eval uses a middle size sample when it is possible to be more reproducible
+        if is_eval:
+            sample_length = int((min_sample_length + max_sample_length) / 2)
+        else:
+            sample_length = random.randint(min_sample_length, max_sample_length)
+        gap = rel_clip.shape[-1] - sample_length
+        if gap < 0:
+            sample_length = rel_clip.shape[-1] // 2
+        gap = rel_clip.shape[-1] - sample_length
 
-    # if eval start always from the position 0 to be more reproducible
-    if is_eval:
-        rand_start = 0
-    else:
-        rand_start = random.randint(0, gap)
+        # if eval start always from the position 0 to be more reproducible
+        if is_eval:
+            rand_start = 0
+        else:
+            rand_start = random.randint(0, gap)
 
-    rand_end = rand_start + sample_length
-    rel_clip = rel_clip[:, rand_start:rand_end]
-    rel_clip = F.pad(rel_clip, pad=(0, max_sample_length - rel_clip.shape[-1]))
-    cond_idxs = [rand_start, rand_end]
-    return rel_clip, rel_clip.shape[-1], cond_idxs
+        rand_end = rand_start + sample_length
+        rel_clip = rel_clip[:, rand_start:rand_end]
+        rel_clip = F.pad(rel_clip, pad=(0, max_sample_length - rel_clip.shape[-1]))
+        cond_idxs = [rand_start, rand_end]
+        return rel_clip, rel_clip.shape[-1], cond_idxs
+    else:
+        ref_clip = load_audio(ref_path, sample_rate)
+
+        sample_length = min(max_sample_length, rel_clip.shape[-1])
+
+        rel_clip = rel_clip[:, :sample_length]
+        rel_clip = F.pad(rel_clip, pad=(0, max_sample_length - rel_clip.shape[-1]))
+        cond_idxs = [0, sample_length]
+        return rel_clip, rel_clip.shape[-1], cond_idxs
+
+
 
 
 class XTTSDataset(torch.utils.data.Dataset):
@@ -73,13 +83,13 @@ class XTTSDataset(torch.utils.data.Dataset):
             random.shuffle(self.samples)
             # order by language
             self.samples = key_samples_by_col(self.samples, "language")
-            logger.info("Sampling by language: %s", self.samples.keys())
+            print(" > Sampling by language:", self.samples.keys())
         else:
             # for evaluation load and check samples that are corrupted to ensures the reproducibility
             self.check_eval_samples()
 
     def check_eval_samples(self):
-        logger.info("Filtering invalid eval samples!!")
+        print(" > Filtering invalid eval samples!!")
         new_samples = []
         for sample in self.samples:
             try:
@@ -95,7 +105,7 @@ class XTTSDataset(torch.utils.data.Dataset):
                 continue
             new_samples.append(sample)
         self.samples = new_samples
-        logger.info("Total eval samples after filtering: %d", len(self.samples))
+        print(" > Total eval samples after filtering:", len(self.samples))
 
     def get_text(self, text, lang):
         tokens = self.tokenizer.encode(text, lang)
@@ -112,14 +122,14 @@ class XTTSDataset(torch.utils.data.Dataset):
         wav = load_audio(audiopath, self.sample_rate)
         if text is None or len(text.strip()) == 0:
             raise ValueError
-        if wav is None or wav.shape[-1] < (0.5 * self.sample_rate):
+        if wav is None or wav.shape[-1] < (0.2 * self.sample_rate):
             # Ultra short clips are also useless (and can cause problems within some models).
             raise ValueError
 
         if self.use_masking_gt_prompt_approach:
             # get a slice from GT to condition the model
             cond, _, cond_idxs = get_prompt_slice(
-                audiopath, self.max_conditioning_length, self.min_conditioning_length, self.sample_rate, self.is_eval
+                audiopath, self.max_conditioning_length, self.min_conditioning_length, self.sample_rate, self.is_eval, sample["ref_file"]
             )
             # if use masking do not use cond_len
             cond_len = torch.nan
@@ -130,7 +140,7 @@ class XTTSDataset(torch.utils.data.Dataset):
                 else audiopath
             )
             cond, cond_len, _ = get_prompt_slice(
-                ref_sample, self.max_conditioning_length, self.min_conditioning_length, self.sample_rate, self.is_eval
+                ref_sample, self.max_conditioning_length, self.min_conditioning_length, self.sample_rate, self.is_eval, sample["ref_file"]
             )
             # if do not use masking use cond_len
             cond_idxs = torch.nan
@@ -153,7 +163,7 @@ class XTTSDataset(torch.utils.data.Dataset):
         # ignore samples that we already know that is not valid ones
         if sample_id in self.failed_samples:
             if self.debug_failures:
-                logger.info("Ignoring sample %s because it was already ignored before !!", sample["audio_file"])
+                print(f"Ignoring sample {sample['audio_file']} because it was already ignored before !!")
             # call get item again to get other sample
             return self[1]
 
@@ -162,7 +172,7 @@ class XTTSDataset(torch.utils.data.Dataset):
             tseq, audiopath, wav, cond, cond_len, cond_idxs = self.load_item(sample)
         except:
             if self.debug_failures:
-                logger.warning("Error loading %s %s", sample["audio_file"], sys.exc_info())
+                print(f"error loading {sample['audio_file']} {sys.exc_info()}")
             self.failed_samples.add(sample_id)
             return self[1]
 
@@ -175,11 +185,8 @@ class XTTSDataset(torch.utils.data.Dataset):
             # Basically, this audio file is nonexistent or too long to be supported by the dataset.
             # It's hard to handle this situation properly. Best bet is to return the a random valid token and skew the dataset somewhat as a result.
             if self.debug_failures and wav is not None and tseq is not None:
-                logger.warning(
-                    "Error loading %s: ranges are out of bounds: %d, %d",
-                    sample["audio_file"],
-                    wav.shape[-1],
-                    tseq.shape[0],
+                print(
+                    f"error loading {sample['audio_file']}: ranges are out of bounds; {wav.shape[-1]}, {tseq.shape[0]}"
                 )
             self.failed_samples.add(sample_id)
             return self[1]
@@ -192,9 +199,9 @@ class XTTSDataset(torch.utils.data.Dataset):
             "wav_lengths": torch.tensor(wav.shape[-1], dtype=torch.long),
             "filenames": audiopath,
             "conditioning": cond.unsqueeze(1),
-            "cond_lens": (
-                torch.tensor(cond_len, dtype=torch.long) if cond_len is not torch.nan else torch.tensor([cond_len])
-            ),
+            "cond_lens": torch.tensor(cond_len, dtype=torch.long)
+            if cond_len is not torch.nan
+            else torch.tensor([cond_len]),
             "cond_idxs": torch.tensor(cond_idxs) if cond_idxs is not torch.nan else torch.tensor([cond_idxs]),
         }
         return res
