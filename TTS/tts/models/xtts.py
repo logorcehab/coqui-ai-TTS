@@ -119,6 +119,7 @@ class XttsAudioConfig(Coqpit):
 
     sample_rate: int = 22050
     output_sample_rate: int = 24000
+    dvae_sample_rate: int = 22050
 
 
 @dataclass
